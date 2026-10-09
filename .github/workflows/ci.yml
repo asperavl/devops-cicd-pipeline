@@ -1,0 +1,154 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Code Validation & Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_password
+          POSTGRES_DB: orders_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.0"
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run Ruff Linter & Formatter
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Run Integration Tests with Coverage Gate
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres_test_password
+          DB_NAME: orders_test_db
+        run: |
+          uv run pytest --cov=app --cov-report=term-missing --cov-fail-under=80 -v
+
+  build-scan-publish:
+    name: Build, Security Scan & Publish
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lowercase image name for GHCR
+        id: image_info
+        run: |
+          echo "IMAGE_LOWER=$(echo '${{ env.REGISTRY }}/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.image_info.outputs.IMAGE_LOWER }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Container Security Scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ steps.image_info.outputs.IMAGE_LOWER }}:test
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Smoke Test Built Image
+        run: |
+          docker network create smoke-net
+          docker run -d --name test-db --network smoke-net \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=orders_db \
+            postgres:16-alpine
+          
+          # Wait for DB to be healthy
+          for i in {1..30}; do
+            if docker exec test-db pg_isready -U postgres; then
+              echo "Database is ready!"
+              break
+            fi
+            sleep 1
+          done
+
+          docker run -d --name test-api --network smoke-net -p 8000:8000 \
+            -e DB_HOST=test-db -e DB_PORT=5432 -e DB_USER=postgres -e DB_PASSWORD=postgres -e DB_NAME=orders_db \
+            ${{ steps.image_info.outputs.IMAGE_LOWER }}:test
+
+          # Smoke test health endpoint
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/health | grep '"healthy"'; then
+              echo "Smoke test passed: API and DB are healthy!"
+              break
+            fi
+            sleep 1
+          done
+
+          docker stop test-api test-db
+          docker rm test-api test-db
+          docker network rm smoke-net
+
+      - name: Log in to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Docker Image to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image_info.outputs.IMAGE_LOWER }}:${{ github.sha }}
+            ${{ steps.image_info.outputs.IMAGE_LOWER }}:latest
+          cache-from: type=gha
+
