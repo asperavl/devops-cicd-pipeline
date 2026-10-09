@@ -109,3 +109,4 @@ $ curl -s http://localhost:8000/orders/1
 
 1. **Host vs Container Port Mapping**: The API container communicates via Docker's bridge network (`db:5432`). Host development tools or pytest connect using the host port mapping (`${DB_PORT:-5432}`).
 2. **Schema Management**: Relies on idempotent `CREATE TABLE IF NOT EXISTS` at application startup. For high-velocity team environments with complex relational schema migrations, Alembic would be the natural progression.
+
